@@ -10,6 +10,7 @@ from typing import Any
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
+from app.samples.quarantine import apply_quarantine, release_quarantines
 from app.samples.repository import AnomalyRepository, ApprovalRepository, BatchRepository, LocationRepository, SampleRepository
 from app.services.audit import AuditService
 
@@ -106,6 +107,8 @@ class SampleLifecycleService:
     def aliquot(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.write")
         parent = self.samples.get(sample_id)
+        if parent["lifecycle_state"] in {"received", "quarantined", "pending_destruction", "destroyed"}:
+            raise ConflictError("当前状态禁止分装")
         total = round(sum(item["quantity"] for item in data["children"]) + data.get("loss_quantity", 0), 9)
         if abs(total - data["requested_quantity"]) > 1e-6:
             raise ValidationError("子样数量与损耗之和必须等于分装数量")
@@ -147,7 +150,7 @@ class SampleLifecycleService:
     def consume(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.consume")
         sample = self.samples.get(sample_id)
-        if sample["lifecycle_state"] in {"destroyed", "pending_destruction", "quarantined"}:
+        if sample["lifecycle_state"] in {"destroyed", "pending_destruction", "quarantined", "received"}:
             raise ConflictError("当前状态禁止消耗")
         existing = self.connection.execute(
             "SELECT * FROM consumption_records WHERE sample_id=? AND idempotency_key=?",
@@ -263,6 +266,14 @@ class ApprovalService:
 
 
 class AnomalyService:
+    TRANSITIONS = {
+        "open": {"investigating", "contained", "resolved", "dismissed"},
+        "investigating": {"contained", "resolved", "dismissed"},
+        "contained": {"resolved"},
+        "resolved": set(),
+        "dismissed": set(),
+    }
+
     def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None):
         self.connection = connection
         self.clock = clock or SystemClock()
@@ -277,9 +288,57 @@ class AnomalyService:
         if data.get("sample_id"):
             self.samples.get(data["sample_id"])
         case_code = data.get("case_code") or f"ANM-{uuid.uuid4().hex[:12]}"
-        case = self.anomalies.create(data, principal.user_id, case_code, to_storage(self.clock.now()))
-        self.audit.record(principal, "anomaly.create", "anomaly_case", str(case["id"]), after=case)
+        now = to_storage(self.clock.now())
+        case = self.anomalies.create(data, principal.user_id, case_code, now)
+        quarantined = apply_quarantine(self.connection, case, principal.user_id, now)
+        if quarantined:
+            case["quarantined_sample_ids"] = quarantined
+        self.audit.record(
+            principal,
+            "anomaly.create",
+            "anomaly_case",
+            str(case["id"]),
+            after=case,
+            metadata={"quarantined_sample_ids": quarantined},
+        )
         return case
+
+    def transition(self, principal: Principal, case_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        principal.require("anomalies.manage")
+        before = self.anomalies.get(case_id)
+        target = data["state"]
+        if target not in self.TRANSITIONS[before["state"]]:
+            raise ConflictError(
+                "异常状态不允许该流转",
+                context={"state": before["state"], "target": target},
+            )
+        resolution = data.get("resolution")
+        if target in {"resolved", "dismissed"} and not resolution:
+            raise ValidationError("了结异常必须填写处理结论")
+        now = to_storage(self.clock.now())
+        cursor = self.connection.execute(
+            """UPDATE anomaly_cases SET state=?,resolution=COALESCE(?,resolution),version=version+1,updated_at=?
+               WHERE id=? AND state=?""",
+            (target, resolution, now, case_id, before["state"]),
+        )
+        if cursor.rowcount != 1:
+            raise ConflictError("异常状态已变化，请刷新后重试")
+        released: list[int] = []
+        if target in {"resolved", "dismissed"}:
+            released = release_quarantines(self.connection, case_id, now)
+        result = self.anomalies.get(case_id)
+        if released:
+            result["released_sample_ids"] = released
+        self.audit.record(
+            principal,
+            "anomaly.transition",
+            "anomaly_case",
+            str(case_id),
+            before=before,
+            after=result,
+            metadata={"released_sample_ids": released},
+        )
+        return result
 
     def list(self, principal: Principal, state: str | None) -> list[dict[str, Any]]:
         principal.require("samples.read")

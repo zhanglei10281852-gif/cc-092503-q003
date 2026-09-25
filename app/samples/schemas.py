@@ -92,3 +92,8 @@ class AnomalyCreate(BaseModel):
         if not self.sample_id and not self.batch_id:
             raise ValueError("sample_id 与 batch_id 至少填写一个")
         return self
+
+
+class AnomalyTransition(BaseModel):
+    state: Literal["investigating", "contained", "resolved", "dismissed"]
+    resolution: str | None = Field(default=None, min_length=4, max_length=1000)

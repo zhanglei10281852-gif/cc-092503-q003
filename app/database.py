@@ -335,6 +335,115 @@ CREATE TABLE IF NOT EXISTS sample_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sample_events_sample ON sample_events(sample_id, id);
+
+CREATE TABLE IF NOT EXISTS receipt_manifest_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES receipt_batches(id),
+    line_key TEXT NOT NULL,
+    item_code TEXT NOT NULL,
+    sample_type TEXT NOT NULL,
+    expected_quantity REAL NOT NULL CHECK(expected_quantity > 0),
+    unit TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    is_current INTEGER NOT NULL DEFAULT 1 CHECK(is_current IN (0,1)),
+    change_reason TEXT NOT NULL DEFAULT '',
+    changed_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(batch_id, line_key, revision)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_manifest_current_line ON receipt_manifest_items(batch_id, line_key) WHERE is_current=1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_manifest_current_code ON receipt_manifest_items(batch_id, item_code) WHERE is_current=1;
+
+CREATE TABLE IF NOT EXISTS receipt_scan_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_code TEXT NOT NULL UNIQUE,
+    batch_id INTEGER NOT NULL REFERENCES receipt_batches(id),
+    receiver_user_id INTEGER NOT NULL REFERENCES users(id),
+    state TEXT NOT NULL CHECK(state IN ('active','paused','completed')),
+    note TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    paused_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scan_sessions_batch ON receipt_scan_sessions(batch_id, state);
+
+CREATE TABLE IF NOT EXISTS receipt_scan_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES receipt_batches(id),
+    session_id INTEGER NOT NULL REFERENCES receipt_scan_sessions(id),
+    idempotency_key TEXT NOT NULL,
+    item_code TEXT NOT NULL,
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    outcome TEXT NOT NULL CHECK(outcome IN ('matched','duplicate','unexpected','label_conflict')),
+    manifest_item_id INTEGER REFERENCES receipt_manifest_items(id),
+    sample_id INTEGER REFERENCES samples(id),
+    damaged INTEGER NOT NULL DEFAULT 0 CHECK(damaged IN (0,1)),
+    note TEXT NOT NULL DEFAULT '',
+    scanned_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(batch_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_scan_events_batch ON receipt_scan_events(batch_id, item_code);
+
+CREATE TABLE IF NOT EXISTS receipt_item_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES receipt_batches(id),
+    item_code TEXT NOT NULL,
+    scan_event_id INTEGER NOT NULL REFERENCES receipt_scan_events(id),
+    manifest_item_id INTEGER REFERENCES receipt_manifest_items(id),
+    sample_id INTEGER REFERENCES samples(id),
+    claimed_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(batch_id, item_code)
+);
+
+CREATE TABLE IF NOT EXISTS receipt_rejections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES receipt_batches(id),
+    manifest_item_id INTEGER REFERENCES receipt_manifest_items(id),
+    line_key TEXT NOT NULL,
+    item_code TEXT NOT NULL,
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    reason TEXT NOT NULL,
+    rejected_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(batch_id, line_key)
+);
+
+CREATE TABLE IF NOT EXISTS receipt_discrepancies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES receipt_batches(id),
+    kind TEXT NOT NULL CHECK(kind IN ('shortage','unexpected','label_conflict','quantity_mismatch','damaged')),
+    line_key TEXT,
+    item_code TEXT NOT NULL,
+    manifest_item_id INTEGER REFERENCES receipt_manifest_items(id),
+    scan_event_id INTEGER REFERENCES receipt_scan_events(id),
+    expected_quantity REAL,
+    observed_quantity REAL,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','explained')),
+    explanation TEXT,
+    explained_by INTEGER REFERENCES users(id),
+    explained_at TEXT,
+    anomaly_id INTEGER REFERENCES anomaly_cases(id),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_discrepancies_batch ON receipt_discrepancies(batch_id, state);
+
+CREATE TABLE IF NOT EXISTS anomaly_quarantines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    anomaly_id INTEGER NOT NULL REFERENCES anomaly_cases(id),
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    previous_state TEXT NOT NULL,
+    released_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(anomaly_id, sample_id)
+);
+CREATE INDEX IF NOT EXISTS idx_quarantines_sample ON anomaly_quarantines(sample_id, released_at);
 """
 
 PERMISSIONS = [
@@ -353,6 +462,7 @@ PERMISSIONS = [
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("locations.read_sensitive", "查看精确保管位置", "locations", "read_sensitive"),
     ("anomalies.manage", "管理异常", "anomalies", "manage"),
+    ("receiving.manage", "执行接收复核", "receiving", "manage"),
 ]
 
 
@@ -431,7 +541,7 @@ def init_db() -> None:
         role_permissions = {
             "sample_manager": [
                 "samples.read", "samples.write", "samples.consume", "samples.destroy",
-                "loans.manage", "inventory.manage", "anomalies.manage",
+                "loans.manage", "inventory.manage", "anomalies.manage", "receiving.manage",
             ],
             "researcher": ["samples.read", "samples.consume"],
             "approver": ["samples.read", "approvals.decide"],

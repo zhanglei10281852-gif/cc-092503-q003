@@ -8,6 +8,7 @@ from app.core.security import Principal
 from app.samples.schemas import (
     AliquotRequest,
     AnomalyCreate,
+    AnomalyTransition,
     ApprovalCreate,
     ApprovalDecision,
     BatchCreate,
@@ -99,6 +100,12 @@ def decide_approval(request_id: int, payload: ApprovalDecision, principal: Princ
 def create_anomaly(payload: AnomalyCreate, principal: Principal = Depends(current_principal)):
     with transaction(immediate=True) as connection:
         return AnomalyService(connection).create(principal, payload.model_dump())
+
+
+@router.post("/anomalies/{case_id}/transitions")
+def transition_anomaly(case_id: int, payload: AnomalyTransition, principal: Principal = Depends(current_principal)):
+    with transaction(immediate=True) as connection:
+        return AnomalyService(connection).transition(principal, case_id, payload.model_dump())
 
 
 @router.get("/anomalies/list")
