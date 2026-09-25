@@ -11,6 +11,7 @@ from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
 from app.samples.repository import AnomalyRepository, ApprovalRepository, BatchRepository, LocationRepository, SampleRepository
+from app.samples.receiving import ensure_not_held
 from app.services.audit import AuditService
 
 
@@ -106,6 +107,9 @@ class SampleLifecycleService:
     def aliquot(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.write")
         parent = self.samples.get(sample_id)
+        ensure_not_held(self.connection, sample_id)
+        if parent["lifecycle_state"] in {"destroyed", "pending_destruction", "quarantined", "received"}:
+            raise ConflictError("当前状态禁止分装")
         total = round(sum(item["quantity"] for item in data["children"]) + data.get("loss_quantity", 0), 9)
         if abs(total - data["requested_quantity"]) > 1e-6:
             raise ValidationError("子样数量与损耗之和必须等于分装数量")
@@ -147,7 +151,8 @@ class SampleLifecycleService:
     def consume(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.consume")
         sample = self.samples.get(sample_id)
-        if sample["lifecycle_state"] in {"destroyed", "pending_destruction", "quarantined"}:
+        ensure_not_held(self.connection, sample_id)
+        if sample["lifecycle_state"] in {"destroyed", "pending_destruction", "quarantined", "received"}:
             raise ConflictError("当前状态禁止消耗")
         existing = self.connection.execute(
             "SELECT * FROM consumption_records WHERE sample_id=? AND idempotency_key=?",
@@ -182,6 +187,7 @@ class LoanService:
     def create(self, principal: Principal, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("loans.manage")
         sample = self.samples.get(data["sample_id"])
+        ensure_not_held(self.connection, data["sample_id"])
         if sample["lifecycle_state"] not in {"available", "partially_consumed"}:
             raise ConflictError("样品当前不可借用")
         if sample["quantity"] - sample["reserved_quantity"] < data["quantity"]:

@@ -335,6 +335,153 @@ CREATE TABLE IF NOT EXISTS sample_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sample_events_sample ON sample_events(sample_id, id);
+
+CREATE TABLE IF NOT EXISTS receiving_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_code TEXT NOT NULL UNIQUE,
+    batch_id INTEGER NOT NULL UNIQUE REFERENCES receipt_batches(id),
+    batch_code TEXT NOT NULL UNIQUE,
+    project_code TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('open','reconciling','closed')),
+    current_version INTEGER NOT NULL DEFAULT 1,
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    closed_by INTEGER REFERENCES users(id),
+    closed_at TEXT,
+    warehouse_eligible INTEGER NOT NULL DEFAULT 0 CHECK(warehouse_eligible IN (0,1)),
+    close_summary_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS receiving_manifest_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES receiving_sessions(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    expected_count INTEGER NOT NULL CHECK(expected_count >= 0),
+    manifest_json TEXT NOT NULL,
+    revision_reason TEXT NOT NULL,
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS receiving_expected_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES receiving_sessions(id) ON DELETE CASCADE,
+    version_added INTEGER NOT NULL,
+    version_removed INTEGER,
+    line_no INTEGER NOT NULL,
+    sample_code TEXT NOT NULL,
+    sample_type TEXT NOT NULL,
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    unit TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'expected' CHECK(status IN ('expected','received','rejected')),
+    resolved_scan_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_expected_lines_active
+    ON receiving_expected_lines(session_id, version_added, version_removed);
+CREATE INDEX IF NOT EXISTS idx_expected_lines_code ON receiving_expected_lines(session_id, sample_code);
+
+CREATE TABLE IF NOT EXISTS receiving_scans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES receiving_sessions(id) ON DELETE CASCADE,
+    scan_code TEXT NOT NULL,
+    matched_line_id INTEGER REFERENCES receiving_expected_lines(id),
+    outcome TEXT NOT NULL CHECK(outcome IN (
+        'accepted','rejected','pending','resolved_accepted','resolved_rejected','duplicate'
+    )),
+    sample_id INTEGER REFERENCES samples(id),
+    sample_type TEXT,
+    quantity REAL,
+    unit TEXT,
+    location_id INTEGER REFERENCES storage_locations(id),
+    scanned_by INTEGER NOT NULL REFERENCES users(id),
+    scan_group TEXT NOT NULL,
+    device_label TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_receiving_scans_session ON receiving_scans(session_id, id);
+
+CREATE TABLE IF NOT EXISTS receiving_scan_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES receiving_sessions(id) ON DELETE CASCADE,
+    scan_group TEXT NOT NULL,
+    item_count INTEGER NOT NULL,
+    accepted_count INTEGER NOT NULL,
+    pending_count INTEGER NOT NULL,
+    duplicate_count INTEGER NOT NULL,
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, scan_group)
+);
+
+CREATE TABLE IF NOT EXISTS receipt_rejections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES receiving_sessions(id) ON DELETE CASCADE,
+    line_id INTEGER REFERENCES receiving_expected_lines(id),
+    sample_code TEXT NOT NULL,
+    reason_code TEXT NOT NULL CHECK(reason_code IN (
+        'damaged_packaging','label_conflict','wrong_item','contamination',
+        'temperature_breach','paperwork_mismatch','other'
+    )),
+    severity TEXT NOT NULL CHECK(severity IN ('low','medium','high','critical')),
+    note TEXT NOT NULL DEFAULT '',
+    anomaly_id INTEGER REFERENCES anomaly_cases(id),
+    rejected_by INTEGER NOT NULL REFERENCES users(id),
+    scan_id INTEGER REFERENCES receiving_scans(id),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rejections_session ON receipt_rejections(session_id, id);
+
+CREATE TABLE IF NOT EXISTS receiving_pending_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES receiving_sessions(id) ON DELETE CASCADE,
+    line_id INTEGER REFERENCES receiving_expected_lines(id),
+    sample_code TEXT NOT NULL,
+    reason_code TEXT NOT NULL CHECK(reason_code IN (
+        'damaged_packaging','label_conflict','wrong_item','contamination',
+        'temperature_breach','paperwork_mismatch','shortage','unexpected_item','other'
+    )),
+    severity TEXT NOT NULL CHECK(severity IN ('low','medium','high','critical')),
+    note TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','received','rejected')),
+    raised_by INTEGER NOT NULL REFERENCES users(id),
+    resolved_by INTEGER REFERENCES users(id),
+    anomaly_id INTEGER REFERENCES anomaly_cases(id),
+    scan_id INTEGER REFERENCES receiving_scans(id),
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_session ON receiving_pending_items(session_id, status);
+
+CREATE TABLE IF NOT EXISTS receiving_holds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES receiving_sessions(id) ON DELETE CASCADE,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    anomaly_id INTEGER REFERENCES anomaly_cases(id),
+    reason_code TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('low','medium','high','critical')),
+    note TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    raised_by INTEGER NOT NULL REFERENCES users(id),
+    released_by INTEGER REFERENCES users(id),
+    released_at TEXT,
+    release_note TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_holds_sample_active ON receiving_holds(sample_id, active);
+
+CREATE TABLE IF NOT EXISTS receiving_resolutions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES receiving_sessions(id) ON DELETE CASCADE,
+    diff_key TEXT NOT NULL,
+    diff_type TEXT NOT NULL CHECK(diff_type IN ('missing','unexpected')),
+    explanation TEXT NOT NULL,
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, diff_key)
+);
 """
 
 PERMISSIONS = [
@@ -353,6 +500,7 @@ PERMISSIONS = [
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("locations.read_sensitive", "查看精确保管位置", "locations", "read_sensitive"),
     ("anomalies.manage", "管理异常", "anomalies", "manage"),
+    ("receiving.manage", "管理接收复核", "receiving", "manage"),
 ]
 
 
@@ -431,7 +579,7 @@ def init_db() -> None:
         role_permissions = {
             "sample_manager": [
                 "samples.read", "samples.write", "samples.consume", "samples.destroy",
-                "loans.manage", "inventory.manage", "anomalies.manage",
+                "loans.manage", "inventory.manage", "anomalies.manage", "receiving.manage",
             ],
             "researcher": ["samples.read", "samples.consume"],
             "approver": ["samples.read", "approvals.decide"],

@@ -13,6 +13,8 @@
 - 位置脱敏：普通权限只能看到受限位置的替代码，授权人员可查看精确位置。
 - 双人审批：高风险操作要求申请人与审批人分离，并累计不同审批人的决定。
 - 异常追踪：异常可以关联样品或接收批次，保存严重度和处理状态。
+- 接收复核：箱单、实收扫描、拒收项、待查项与差异解释纳入同一批次状态机（开放 → 差异复核 → 关闭），支持分次扫描与断点继续，关闭前必须解释全部差异。
+- 高风险隔离：高风险异常自动把相关样品放入隔离状态并阻止借用、消耗与分装，解除需授权人员登记原因。
 - 审计与任务：关键身份及业务操作留痕，后台任务支持去重、领取与完成。
 
 ## 运行环境
@@ -61,3 +63,13 @@ python -m compileall -q app tests
 ```bash
 python -m app.cli smoke
 ```
+
+## 接收复核流程
+
+1. `POST /api/receiving/sessions` 开启接收批次并登记预期箱单（可含逐行明细）。
+2. `POST /api/receiving/sessions/{id}/scans` 分次提交实收扫描；同一 `scan_group` 重复提交按幂等回放，不同接收员扫同一条码自动去重，不会重复计数。
+3. `POST /api/receiving/sessions/{id}/rejections` 登记拒收；`POST .../pending` 登记待查；待查件通过 `POST .../pending/{pid}/resolutions` 判为收讫或拒收。
+4. `PUT /api/receiving/sessions/{id}/manifest` 修正箱单，每次修正保存完整版本与原因，已接收/已拒收明细不可移除。
+5. `POST /api/receiving/sessions/{id}/reconcile` 生成差异对账；少件与清单外实物必须通过 `POST .../differences/explanations` 登记解释，否则无法关闭。
+6. `POST /api/receiving/sessions/{id}/close` 关闭批次：无阻碍项的样品转为可入库，返回数量对账、异常关联与是否可入库结论；`POST .../reopen` 可退回继续扫描。
+7. 高风险（high/critical）异常自动生成异常案并把相关样品隔离，借用、消耗、分装均被阻止；`POST .../holds/{hid}/release` 由具备异常管理权限的人员解除。
